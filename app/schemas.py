@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, field_validator, ConfigDict
-from typing import Optional, Literal
+from pydantic import BaseModel, Field, model_validator, ConfigDict
+from typing import Optional, Literal, List
 from datetime import datetime
 
 class CreditApplicationRequest(BaseModel):
@@ -31,15 +31,14 @@ class CreditApplicationRequest(BaseModel):
         ..., ge=0, le=100, description="Credit history length in years", json_schema_extra={"example": 4}
     )
 
-    @field_validator("loan_percent_income", mode="before")
-    def compute_percent_income_if_missing(cls, v, info):
-        if v is None and "loan_amnt" in info.data and "person_income" in info.data:
-            income = info.data["person_income"]
-            amnt = info.data["loan_amnt"]
-            if income > 0:
-                return round(float(amnt / income), 4)
-            return 1.0
-        return v
+    @model_validator(mode="after")
+    def compute_percent_income_if_missing(self):
+        if self.loan_percent_income is None:
+            if self.person_income > 0:
+                self.loan_percent_income = min(1.0, round(float(self.loan_amnt / self.person_income), 4))
+            else:
+                self.loan_percent_income = 1.0
+        return self
 
 
 class PredictionResponse(BaseModel):
@@ -65,5 +64,42 @@ class PredictionRecordResponse(BaseModel):
     cb_person_cred_hist_length: int
     prediction: str
     probability: float
+    review_status: str = "PENDING"
+    reviewer_notes: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PredictionReviewUpdate(BaseModel):
+    review_status: Literal["PENDING", "APPROVED", "REJECTED"] = Field(
+        ..., description="Underwriter review decision", json_schema_extra={"example": "APPROVED"}
+    )
+    reviewer_notes: Optional[str] = Field(
+        None, max_length=500, description="Optional notes from underwriter review", json_schema_extra={"example": "Verified income statements."}
+    )
+
+
+class GradeStats(BaseModel):
+    loan_grade: str
+    count: int
+    high_risk_count: int
+    avg_probability: float
+
+
+class IntentStats(BaseModel):
+    loan_intent: str
+    count: int
+    high_risk_count: int
+    avg_probability: float
+
+
+class PredictionStatsResponse(BaseModel):
+    total_predictions: int
+    high_risk_count: int
+    low_risk_count: int
+    high_risk_rate_pct: float
+    avg_probability: float
+    avg_loan_amount: float
+    avg_person_income: float
+    by_loan_grade: List[GradeStats]
+    by_loan_intent: List[IntentStats]

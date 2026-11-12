@@ -1,47 +1,52 @@
+import json
 import logging
 import os
-import json
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Literal, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import init_db, get_db, PredictionHistory
+from app.database import PredictionHistory, get_db, init_db
+from app.predictor import predictor
 from app.schemas import (
     CreditApplicationRequest,
+    PredictionRecordResponse,
     PredictionResponse,
-    PredictionRecordResponse
+    PredictionReviewUpdate,
+    PredictionStatsResponse,
 )
-from app.predictor import predictor
+from app.sql_queries import (
+    delete_prediction_sql,
+    fetch_prediction_stats,
+    filter_predictions_sql,
+    update_prediction_review_sql,
+)
 
-# Setup Structured Logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger("credit_risk_api")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle hook for startup and shutdown procedures."""
-    logger.info("Starting up Credit Risk Prediction API...")
+    logger.info("Starting Credit Risk Prediction API...")
     try:
         init_db()
-        logger.info("Database initialized successfully.")
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
+        logger.error(f"Database initialization failed: {e}")
 
     try:
         if predictor.pipeline is None:
             predictor.load_model()
-        logger.info("Machine learning model verified.")
     except Exception as e:
-        logger.warning(f"Could not load ML model on startup: {e}")
+        logger.warning(f"Failed to load ML model on startup: {e}")
 
     yield
     logger.info("Shutting down Credit Risk Prediction API.")
@@ -49,14 +54,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Credit Risk Prediction API",
-    description="A production-grade REST API serving a trained Machine Learning model to evaluate loan default risk, backed by PostgreSQL.",
+    description="REST API serving a Scikit-learn credit risk model with SQL persistence.",
     version=settings.APP_VERSION,
     lifespan=lifespan,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
 )
 
-# Enable CORS for frontend or client integrations
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,27 +70,17 @@ app.add_middleware(
 )
 
 
-@app.get(
-    "/",
-    tags=["General"],
-    summary="Root Endpoint",
-    description="Returns a welcome message, API version, and a link to the interactive documentation."
-)
+@app.get("/", tags=["General"], summary="Root Endpoint")
 def root():
     return {
         "message": "Welcome to the Credit Risk Prediction API",
         "version": settings.APP_VERSION,
         "docs_url": "/docs",
-        "status": "running"
+        "status": "running",
     }
 
 
-@app.get(
-    "/health",
-    tags=["System"],
-    summary="Health Check",
-    description="Verifies the operational status of the API, ML model, and database connection."
-)
+@app.get("/health", tags=["System"], summary="Health Check")
 def health_check(db: Session = Depends(get_db)):
     db_status = "connected"
     try:
@@ -96,16 +90,18 @@ def health_check(db: Session = Depends(get_db)):
         db_status = "disconnected"
 
     model_status = "loaded" if predictor.pipeline is not None else "not_loaded"
-
     overall_healthy = (db_status == "connected") and (model_status == "loaded")
-    status_code = status.HTTP_200_OK if overall_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    code = status.HTTP_200_OK if overall_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
 
-    return {
-        "status": "healthy" if overall_healthy else "degraded",
-        "database": db_status,
-        "model": model_status,
-        "version": settings.APP_VERSION
-    }
+    return JSONResponse(
+        status_code=code,
+        content={
+            "status": "healthy" if overall_healthy else "degraded",
+            "database": db_status,
+            "model": model_status,
+            "version": settings.APP_VERSION,
+        },
+    )
 
 
 @app.post(
@@ -114,28 +110,22 @@ def health_check(db: Session = Depends(get_db)):
     status_code=status.HTTP_200_OK,
     tags=["Inference"],
     summary="Predict Credit Risk",
-    description="Evaluates a loan applicant's details and returns the default prediction, probability, and logs the result to PostgreSQL."
 )
 def predict_credit_risk(
     application: CreditApplicationRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    logger.info(f"Received prediction request for applicant age {application.person_age}, amount ${application.loan_amnt}")
-    
-    # 1. Prepare feature dictionary for model inference
     applicant_dict = application.model_dump()
 
-    # 2. Run inference using the pre-loaded ML pipeline
     try:
         inference_result = predictor.predict(applicant_dict)
     except Exception as e:
         logger.error(f"Inference error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while generating credit risk prediction."
+            detail="Failed to generate credit risk prediction.",
         )
 
-    # 3. Persist prediction transaction to the database
     prediction_record = PredictionHistory(
         person_age=application.person_age,
         person_income=application.person_income,
@@ -149,26 +139,24 @@ def predict_credit_risk(
         cb_person_default_on_file=application.cb_person_default_on_file,
         cb_person_cred_hist_length=application.cb_person_cred_hist_length,
         prediction=inference_result["prediction"],
-        probability=inference_result["probability"]
+        probability=inference_result["probability"],
     )
 
     try:
         db.add(prediction_record)
         db.commit()
         db.refresh(prediction_record)
-        logger.info(f"Stored prediction result in database with ID: {prediction_record.id}")
         prediction_id = prediction_record.id
     except Exception as e:
         db.rollback()
         logger.error(f"Database save error: {e}", exc_info=True)
-        # Even if DB fails, we still return the prediction to the client with prediction_id = None
         prediction_id = None
 
     return PredictionResponse(
         prediction=inference_result["prediction"],
         probability=inference_result["probability"],
         default_risk=inference_result["default_risk"],
-        prediction_id=prediction_id
+        prediction_id=prediction_id,
     )
 
 
@@ -177,21 +165,33 @@ def predict_credit_risk(
     response_model=List[PredictionRecordResponse],
     tags=["History"],
     summary="List Prediction History",
-    description="Retrieves stored credit risk predictions from the database with pagination."
 )
 def get_prediction_history(
-    limit: int = Query(10, ge=1, le=100, description="Maximum records to retrieve"),
-    offset: int = Query(0, ge=0, description="Offset record index"),
-    db: Session = Depends(get_db)
+    prediction: Optional[Literal["Low Risk", "High Risk"]] = Query(None),
+    loan_grade: Optional[Literal["A", "B", "C", "D", "E", "F", "G"]] = Query(None),
+    review_status: Optional[Literal["PENDING", "APPROVED", "REJECTED"]] = Query(None),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
 ):
-    records = (
-        db.query(PredictionHistory)
-        .order_by(PredictionHistory.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
+    return filter_predictions_sql(
+        db=db,
+        prediction=prediction,
+        loan_grade=loan_grade,
+        review_status=review_status,
+        limit=limit,
+        offset=offset,
     )
-    return records
+
+
+@app.get(
+    "/predictions/stats",
+    response_model=PredictionStatsResponse,
+    tags=["Analytics"],
+    summary="Portfolio Risk Statistics",
+)
+def get_prediction_statistics(db: Session = Depends(get_db)):
+    return fetch_prediction_stats(db)
 
 
 @app.get(
@@ -199,27 +199,58 @@ def get_prediction_history(
     response_model=PredictionRecordResponse,
     tags=["History"],
     summary="Get Prediction By ID",
-    description="Retrieves a specific prediction record from the database by its unique identifier."
 )
-def get_prediction_by_id(
-    prediction_id: int,
-    db: Session = Depends(get_db)
-):
+def get_prediction_by_id(prediction_id: int, db: Session = Depends(get_db)):
     record = db.query(PredictionHistory).filter(PredictionHistory.id == prediction_id).first()
     if not record:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Prediction record with ID {prediction_id} not found."
+            detail=f"Prediction record with ID {prediction_id} not found.",
         )
     return record
 
 
-@app.get(
-    "/model/metrics",
-    tags=["System"],
-    summary="Get Model Performance Metrics",
-    description="Returns cross-validation and test set evaluation metrics for the deployed model."
+@app.patch(
+    "/predictions/{prediction_id}",
+    response_model=PredictionRecordResponse,
+    tags=["History"],
+    summary="Update Prediction Review Status",
 )
+def update_prediction_review(
+    prediction_id: int,
+    review: PredictionReviewUpdate,
+    db: Session = Depends(get_db),
+):
+    updated = update_prediction_review_sql(
+        db=db,
+        prediction_id=prediction_id,
+        review_status=review.review_status,
+        reviewer_notes=review.reviewer_notes,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prediction record with ID {prediction_id} not found.",
+        )
+    return updated
+
+
+@app.delete(
+    "/predictions/{prediction_id}",
+    tags=["History"],
+    summary="Delete Prediction Record",
+)
+def delete_prediction_by_id(prediction_id: int, db: Session = Depends(get_db)):
+    deleted = delete_prediction_sql(db=db, prediction_id=prediction_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prediction record with ID {prediction_id} not found.",
+        )
+    return {"message": f"Prediction record {prediction_id} deleted successfully."}
+
+
+@app.get("/model/metrics", tags=["System"], summary="Get Model Performance Metrics")
 def get_model_metrics():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     metrics_path = os.path.join(project_root, "models", "model_metrics.json")
@@ -228,5 +259,5 @@ def get_model_metrics():
             return json.load(f)
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
-        detail="Model metrics file not found."
+        detail="Model metrics file not found.",
     )
